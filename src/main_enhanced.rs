@@ -378,22 +378,35 @@ fn render_display(
     let mut img = GrayImage::from_pixel(WIDTH, HEIGHT, WHITE);
     let now = Local::now();
 
-    // week_start: Monday of the current week
-    let today_pre  = now.date_naive();
-    let week_start = today_pre - chrono::Duration::days(today_pre.weekday().num_days_from_monday() as i64);
+    // ── Header bar ──────────────────────────────────────────────────────────
+    // week_start: Monday of the current week (needed for header + grid)
+    let today_pre   = now.date_naive();
+    let week_start  = today_pre - chrono::Duration::days(today_pre.weekday().num_days_from_monday() as i64);
+    draw_filled_rect_mut(&mut img, Rect::at(0, 0).of_size(WIDTH, 48), BLACK);
+    let range_end   = week_start + chrono::Duration::days(27);
+    let header_text = format!(
+        "{}  –  {}   ·   {}",
+        week_start.format("%d %b"),
+        range_end.format("%d %b %Y"),
+        now.format("%H:%M"),
+    );
+    draw_text_mut(&mut img, WHITE, 16, 12, PxScale::from(26.0), font_bold, &header_text);
 
-    // ── Day-of-week column headers (slim row at very top) ────────────────────
+    // ── Day-of-week column headers ───────────────────────────────────────────
     let dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let cell_w = WIDTH as i32 / 7;
+    let header_y = 52i32;
     for (i, label) in dow_labels.iter().enumerate() {
         let is_weekend = i >= 5;
         let col_x = i as i32 * cell_w + cell_w / 2 - 12;
-        let col   = if is_weekend { DARK_GRAY } else { BLACK };
-        draw_text_mut(&mut img, col, col_x, 2, PxScale::from(15.0), font_bold, label);
+        let col  = if is_weekend { DARK_GRAY } else { BLACK };
+        draw_text_mut(&mut img, col, col_x, header_y, PxScale::from(15.0), font_bold, label);
     }
-    draw_line_segment_mut(&mut img, (0.0, 20.0), (WIDTH as f32, 20.0), DARK_GRAY);
 
-        // ── Build events-by-date map ─────────────────────────────────────────────
+    // Separator
+    draw_line_segment_mut(&mut img, (0.0, 70.0), (WIDTH as f32, 70.0), DARK_GRAY);
+
+    // ── Build events-by-date map ─────────────────────────────────────────────
     use std::collections::HashMap as HMap;
     let mut events_by_date: HMap<chrono::NaiveDate, Vec<&CalendarEvent>> = HMap::new();
     for ev in events {
@@ -405,7 +418,7 @@ fn render_display(
     let num_rows   = 4i32;
     let total_days = 28u32;
 
-    let grid_y0  = 22i32;
+    let grid_y0  = 72i32;
     let grid_bot = HEIGHT as i32 - 20; // leave room for footer
     let row_h    = (grid_bot - grid_y0) / num_rows;
 
@@ -432,6 +445,10 @@ fn render_display(
             draw_filled_rect_mut(&mut img,
                 Rect::at(cell_x, cell_y).of_size(cell_w as u32, row_h as u32 - 1),
                 BLACK);
+        } else if is_weekend {
+            draw_filled_rect_mut(&mut img,
+                Rect::at(cell_x, cell_y).of_size(cell_w as u32, row_h as u32 - 1),
+                Luma([242u8]));
         }
 
         // Grid lines

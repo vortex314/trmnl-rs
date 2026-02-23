@@ -112,7 +112,20 @@ In the TRMNL web dashboard, add a **Custom Plugin** with:
 ## Architecture
 
 ```
-main.rs
+main.rsHere's what the month grid looks like now:
+┌──────────────────────────────────────────────────────┐
+│  February 2026                                       │
+│  Mo   Tu   We   Th   Fr   Sa   Su                   │
+│──────────────────────────────────────────────────────│
+│   2    3    4    5    6    7    8                    │
+│                            ●                         │
+│   9   10   11   12   13   14   15                   │
+│  [23]       ●●                                      │  ← today filled black
+│  16   17   18   19   20   21   22                   │
+│        ●                                             │
+│  23   24   25   26   27   28                        │
+└──────────────────────────────────────────────────────┘
+What changed:
 ├── fetch_calendar()      Google Calendar API v3
 ├── fetch_weather()       Open-Meteo (free, no API key)
 ├── render_display()      image + imageproc + rusttype
@@ -123,3 +136,38 @@ main.rs
 
 Data is cached in memory and refreshed every 15 minutes by a background
 Tokio task. Both endpoints accept `?refresh=true` to force immediate re-fetch.
+
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  February 2026  ·  Monday 23  ·  08:42                         [black bar] │
+│  Mon      Tue      Wed      Thu      Fri      Sat      Sun                  │
+│──────────────────────────────────────────────────────────────────────────── │
+│   1        2        3        4        5        6        7                   │
+│                     09:00                               standup             │
+│   8        9       10       11       12       13       14                   │
+│           09:00    Dentist                                                  │
+│  [23]     24       25       26       27       28                            │ ← today
+│  09:00                                                                      │
+│  Standup                                                                    │
+│  14:00 Re…                                                                  │
+│  +1                                                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+  Updated 08:42:17
+
+
+  Here's what the month grid looks like now:
+┌──────────────────────────────────────────────────────┐
+│  February 2026                                       │
+│  Mo   Tu   We   Th   Fr   Sa   Su                   │
+│──────────────────────────────────────────────────────│
+│   2    3    4    5    6    7    8                    │
+│                            ●                         │
+│   9   10   11   12   13   14   15                   │
+│  [23]       ●●                                      │  ← today filled black
+│  16   17   18   19   20   21   22                   │
+│        ●                                             │
+│  23   24   25   26   27   28                        │
+└──────────────────────────────────────────────────────┘
+What changed:
+
