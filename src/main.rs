@@ -13,22 +13,24 @@
 //   GET /preview          → PNG (grayscale) for browser preview
 //   GET /health           → 200 OK
 // ─────────────────────────────────────────────────────────────────────────────
-
+#![allow(dead_code)]
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
+    Json,
     Router,
 };
-use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
-use image::{GrayImage, Luma, RgbaImage};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
+use chrono_tz::Tz;
+use image::{GrayImage, Luma};
 use imageproc::drawing::{draw_filled_rect_mut, draw_line_segment_mut, draw_text_mut};
 use imageproc::rect::Rect;
 use ab_glyph::{FontVec, PxScale};
-use serde::Deserialize;
-use std::{collections::HashMap, env, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{env, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
@@ -48,8 +50,8 @@ const DARK_GRAY: Luma<u8> = Luma([80]);
 #[derive(Debug, Clone)]
 struct CalendarEvent {
     summary: String,
-    start: DateTime<Local>,
-    end: DateTime<Local>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
     all_day: bool,
 }
 
@@ -74,11 +76,20 @@ struct HourlyForecast {
 
 // ── App state with simple cache ───────────────────────────────────────────────
 
+/// Registered device: MAC → access token
+#[derive(Clone, Debug)]
+struct Device {
+    mac: String,
+    access_token: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
     oauth: Option<Arc<OAuthTokenManager>>,
     cache: Arc<RwLock<DisplayCache>>,
+    /// MAC address → Device (auto-registered on first /api/setup)
+    devices: Arc<RwLock<Vec<Device>>>,
     font_regular: Arc<FontVec>,
     font_bold: Arc<FontVec>,
 }
@@ -95,6 +106,10 @@ struct Config {
     weather_lat: f64,
     weather_lon: f64,
     trmnl_api_key: Option<String>,
+    /// IANA timezone for display rendering, e.g. Europe/Brussels
+    display_tz: Tz,
+    /// Public base URL of this server, e.g. http://192.168.1.10:3000
+    base_url: String,
 }
 
 // ── OAuth2 token manager (auto-refresh) ──────────────────────────────────────
@@ -250,15 +265,20 @@ async fn fetch_calendar(config: &Config, oauth: Option<&OAuthTokenManager>) -> R
 
             if let Some(dt_str) = &item.start.date_time {
                 // Timed event
-                let start = DateTime::parse_from_rfc3339(dt_str).ok()?.with_timezone(&Local);
+                let start = DateTime::parse_from_rfc3339(dt_str).ok()?.with_timezone(&Utc);
                 let end_str = item.end.date_time.as_deref()?;
-                let end = DateTime::parse_from_rfc3339(end_str).ok()?.with_timezone(&Local);
+                let end = DateTime::parse_from_rfc3339(end_str).ok()?.with_timezone(&Utc);
                 Some(CalendarEvent { summary, start, end, all_day: false })
             } else if let Some(date_str) = &item.start.date {
                 // All-day event
                 let naive = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
-                let start = Local.from_local_datetime(&naive.and_hms_opt(0, 0, 0)?).single()?;
-                let end = start + chrono::Duration::days(1);
+                let start_local = config
+                    .display_tz
+                    .from_local_datetime(&naive.and_hms_opt(0, 0, 0)?)
+                    .single()?;
+                let end_local = start_local + chrono::Duration::days(1);
+                let start = start_local.with_timezone(&Utc);
+                let end = end_local.with_timezone(&Utc);
                 Some(CalendarEvent { summary, start, end, all_day: true })
             } else {
                 None
@@ -330,7 +350,7 @@ async fn fetch_weather(config: &Config) -> Result<WeatherData> {
     let (condition, icon) = wmo_to_condition(resp.current.weather_code);
 
     // Pick next 8 hourly slots from now
-    let now_h = Local::now().hour() as usize;
+    let now_h = Utc::now().hour() as usize;
     let hourly: Vec<HourlyForecast> = resp
         .hourly
         .time
@@ -374,9 +394,10 @@ fn render_display(
     events: &[CalendarEvent],
     font_regular: &FontVec,
     font_bold: &FontVec,
+    display_tz: Tz,
 ) -> GrayImage {
     let mut img = GrayImage::from_pixel(WIDTH, HEIGHT, WHITE);
-    let now = Local::now();
+    let now = Utc::now().with_timezone(&display_tz);
 
     // week_start: Monday of the current week
     let today_pre  = now.date_naive();
@@ -397,7 +418,10 @@ fn render_display(
     use std::collections::HashMap as HMap;
     let mut events_by_date: HMap<chrono::NaiveDate, Vec<&CalendarEvent>> = HMap::new();
     for ev in events {
-        events_by_date.entry(ev.start.date_naive()).or_default().push(ev);
+        events_by_date
+            .entry(ev.start.with_timezone(&display_tz).date_naive())
+            .or_default()
+            .push(ev);
     }
 
     // ── 4-week grid geometry (28 days, always 4 rows) ──────────────────────
@@ -474,7 +498,7 @@ fn render_display(
                         format!("{}…", t.chars().take(t.len().saturating_sub(1)).collect::<String>())
                     } else { t }
                 } else {
-                    let prefix = ev.start.format("%H:%M ").to_string();
+                    let prefix = ev.start.with_timezone(&display_tz).format("%H:%M ").to_string();
                     let rem    = max_chars.saturating_sub(prefix.len());
                     format!("{}{}", prefix, ev.summary.chars().take(rem).collect::<String>())
                 };
@@ -540,22 +564,22 @@ fn encode_bmp_1bit(img: &GrayImage) -> Vec<u8> {
     // BITMAPINFOHEADER (40 bytes)
     bmp.extend_from_slice(&40u32.to_le_bytes());
     bmp.extend_from_slice(&(w as i32).to_le_bytes());
-    bmp.extend_from_slice(&(-(h as i32)).to_le_bytes()); // top-down scan
-    bmp.extend_from_slice(&1u16.to_le_bytes());          // color planes
-    bmp.extend_from_slice(&1u16.to_le_bytes());          // bits per pixel
-    bmp.extend_from_slice(&0u32.to_le_bytes());          // no compression
+    bmp.extend_from_slice(&(h as i32).to_le_bytes()); // bottom-up scan for wider BMP compatibility
+    bmp.extend_from_slice(&1u16.to_le_bytes());       // color planes
+    bmp.extend_from_slice(&1u16.to_le_bytes());       // bits per pixel
+    bmp.extend_from_slice(&0u32.to_le_bytes());       // no compression
     bmp.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
-    bmp.extend_from_slice(&2835u32.to_le_bytes());       // ~72 dpi x
-    bmp.extend_from_slice(&2835u32.to_le_bytes());       // ~72 dpi y
-    bmp.extend_from_slice(&2u32.to_le_bytes());          // colors in table
-    bmp.extend_from_slice(&0u32.to_le_bytes());          // important colors
+    bmp.extend_from_slice(&2835u32.to_le_bytes());    // ~72 dpi x
+    bmp.extend_from_slice(&2835u32.to_le_bytes());    // ~72 dpi y
+    bmp.extend_from_slice(&2u32.to_le_bytes());       // colors in table
+    bmp.extend_from_slice(&0u32.to_le_bytes());       // important colors
 
     // Color table: index 0 = black, index 1 = white
     bmp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
     bmp.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x00]);
 
     // Pixel data
-    for y in 0..h {
+    for y in (0..h).rev() {
         let mut col = 0usize;
         let mut bit = 7i32;
         let mut byte = 0u8;
@@ -568,12 +592,18 @@ fn encode_bmp_1bit(img: &GrayImage) -> Vec<u8> {
             if bit < 0 {
                 bmp.push(byte);
                 byte = 0;
-                bit  = 7;
+                bit = 7;
                 col += 1;
             }
         }
-        if bit < 7 { bmp.push(byte); col += 1; }      // flush partial byte
-        while col < row_bytes { bmp.push(0); col += 1; } // row padding
+        if bit < 7 {
+            bmp.push(byte);
+            col += 1;
+        }
+        while col < row_bytes {
+            bmp.push(0);
+            col += 1;
+        }
     }
 
     bmp
@@ -583,7 +613,7 @@ fn encode_bmp_1bit(img: &GrayImage) -> Vec<u8> {
 
 async fn refresh_data(state: &AppState) -> Result<()> {
     let events = fetch_calendar(&state.config, state.oauth.as_deref()).await.unwrap_or_else(|e| {
-        error!("Calendar fetch error: {e}");
+        error!("Calendar fetch error: {e:#}");
         vec![]
     });
 
@@ -593,6 +623,36 @@ async fn refresh_data(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+// ── BYOS API types ───────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SetupResponse {
+    api_key: String,
+    friendly_id: String,
+    image_url: String,
+    filename: String,
+}
+
+#[derive(Serialize)]
+struct DisplayApiResponse {
+    image_url: String,
+    filename: String,
+    refresh_rate: u32,
+    update_firmware: bool,
+    firmware_url: Option<String>,
+    reset_firmware: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct LogEntry {
+    #[serde(default)]
+    log: serde_json::Value,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
 // ── Request query params ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -600,38 +660,113 @@ struct DisplayQuery {
     refresh: Option<bool>,
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
+// ── Auth helpers ─────────────────────────────────────────────────────────────
 
-async fn auth_check(headers: &HeaderMap, config: &Config) -> bool {
-    if let Some(expected) = &config.trmnl_api_key {
-        let ok_bearer = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim_start_matches("Bearer ") == expected)
-            .unwrap_or(false);
-
-        let ok_key = headers
-            .get("X-TRMNL-Api-Key")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s == expected)
-            .unwrap_or(false);
-
-        ok_bearer || ok_key
-    } else {
-        true // no key configured → open
-    }
+fn device_mac(headers: &HeaderMap) -> Option<String> {
+    headers.get("ID").and_then(|v| v.to_str().ok()).map(|s| s.to_lowercase())
 }
 
-/// BMP endpoint for TRMNL firmware
-async fn handle_display(
+fn access_token_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("Access-Token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+}
+
+/// Generate a simple deterministic API key from the MAC address.
+fn mac_to_api_key(mac: &str) -> String {
+    // Simple but stable: hex-encode a FNV-1a hash of the MAC
+    let mut hash: u64 = 14695981039346656037;
+    for b in mac.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    format!("{:016x}", hash)
+}
+
+fn ensure_refreshed_image(state: &AppState) -> (String, String) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let filename = format!("calendar_{}.bmp", ts);
+    let url = format!("{}/api/image/{}", state.config.base_url, filename);
+    (url, filename)
+}
+
+// ── BYOS: GET /api/setup ─────────────────────────────────────────────────────
+//
+// Called by the device on first boot or after factory reset.
+// Header: ID = device MAC address
+// Response: JSON with api_key and image_url
+async fn handle_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let mac = match device_mac(&headers) {
+        Some(m) => m,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"missing ID header"}))).into_response(),
+    };
+
+    let api_key = mac_to_api_key(&mac);
+
+    // Register device if not already known
+    {
+        let mut devices = state.devices.write().await;
+        if !devices.iter().any(|d| d.mac == mac) {
+            info!("Setup: registering new device MAC={mac}");
+            devices.push(Device { mac: mac.clone(), access_token: api_key.clone() });
+        }
+    }
+
+    let (image_url, filename) = ensure_refreshed_image(&state);
+    info!("Setup: MAC={mac} api_key={api_key}");
+
+    Json(SetupResponse {
+        api_key,
+        friendly_id: mac[..6.min(mac.len())].to_uppercase().replace(':', ""),
+        image_url,
+        filename,
+    }).into_response()
+}
+
+// ── BYOS: GET /api/display ───────────────────────────────────────────────────
+//
+// Called by the device on every refresh cycle.
+// Headers: ID = MAC, Access-Token = api_key from /api/setup
+// Response: JSON with image_url + refresh_rate
+async fn handle_api_display(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<DisplayQuery>,
 ) -> Response {
-    if !auth_check(&headers, &state.config).await {
-        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    let mac = match device_mac(&headers) {
+        Some(m) => m,
+        None => return (StatusCode::BAD_REQUEST, "missing ID header").into_response(),
+    };
+
+    // Auth is intentionally permissive: accept any MAC and any Access-Token.
+    // Keep a best-effort in-memory registry for logging/diagnostics only.
+    let token = access_token_header(&headers).unwrap_or("").to_string();
+    {
+        let mut devices = state.devices.write().await;
+        if let Some(dev) = devices.iter_mut().find(|d| d.mac == mac) {
+            if !token.is_empty() && dev.access_token != token {
+                info!("Display auth disabled: MAC={mac} updating stored Access-Token");
+                dev.access_token = token.clone();
+            }
+        } else {
+            let access_token = if token.is_empty() {
+                mac_to_api_key(&mac)
+            } else {
+                token.clone()
+            };
+            info!("Display auth disabled: auto-registering MAC={mac}");
+            devices.push(Device { mac: mac.clone(), access_token });
+        }
     }
 
+    // Trigger data refresh if stale or requested
     let needs_refresh = q.refresh.unwrap_or(false)
         || state.cache.read().await.last_updated.is_none();
 
@@ -641,28 +776,78 @@ async fn handle_display(
         }
     }
 
+    let refresh_rate = env::var("REFRESH_RATE_SECS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(900u32);
+
+    let (image_url, filename) = ensure_refreshed_image(&state);
+
+    info!("Display: MAC={mac} → {filename}");
+
+    Json(DisplayApiResponse {
+        image_url,
+        filename,
+        refresh_rate,
+        update_firmware: false,
+        firmware_url: None,
+        reset_firmware: false,
+    }).into_response()
+}
+
+// ── BYOS: POST /api/log ──────────────────────────────────────────────────────
+//
+// Device sends diagnostic log entries here.
+// We just print them to stdout/tracing.
+async fn handle_log(
+    State(_state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let mac = device_mac(&headers).unwrap_or_else(|| "unknown".into());
+
+    // Try to parse as JSON, fall back to raw string
+    let msg = if let Ok(text) = std::str::from_utf8(&body) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+            val.to_string()
+        } else {
+            text.to_string()
+        }
+    } else {
+        format!("<{} bytes binary>", body.len())
+    };
+
+    info!("Device log [MAC={mac}]: {msg}");
+
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))).into_response()
+}
+
+// ── Image serving: GET /api/image/:filename ──────────────────────────────────
+//
+// The device fetches the BMP here after /api/display tells it the URL.
+// We render fresh each time (the filename timestamp acts as cache-buster).
+async fn handle_image(
+    State(state): State<AppState>,
+    Path(filename): Path<String>,
+) -> Response {
+    info!("Image fetch: {filename}");
+
     let cache = state.cache.read().await;
     let img = render_display(
         &cache.events,
         &state.font_regular,
         &state.font_bold,
+        state.config.display_tz,
     );
     drop(cache);
 
     let bmp = encode_bmp_1bit(&img);
-
     (
         StatusCode::OK,
-        [
-            ("Content-Type", "image/bmp"),
-            ("Cache-Control", "no-store"),
-        ],
+        [("Content-Type", "image/bmp"), ("Cache-Control", "no-store")],
         bmp,
-    )
-        .into_response()
+    ).into_response()
 }
 
-/// PNG endpoint for browser preview
+// ── Browser preview: GET /preview ────────────────────────────────────────────
 async fn handle_preview(
     State(state): State<AppState>,
     Query(q): Query<DisplayQuery>,
@@ -681,29 +866,23 @@ async fn handle_preview(
         &cache.events,
         &state.font_regular,
         &state.font_bold,
+        state.config.display_tz,
     );
     drop(cache);
 
     let mut png_bytes: Vec<u8> = Vec::new();
-    {
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        img.write_to(&mut cursor, image::ImageFormat::Png)
-            .expect("PNG encode failed");
-    }
+    let mut cursor = std::io::Cursor::new(&mut png_bytes);
+    img.write_to(&mut cursor, image::ImageFormat::Png).expect("PNG encode failed");
 
     (
         StatusCode::OK,
-        [
-            ("Content-Type", "image/png"),
-            ("Cache-Control", "no-store"),
-        ],
+        [("Content-Type", "image/png"), ("Cache-Control", "no-store")],
         png_bytes,
-    )
-        .into_response()
+    ).into_response()
 }
 
 async fn handle_health() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+    (StatusCode::OK, Json(serde_json::json!({"status":"ok"})))
 }
 
 // ── Font loading ──────────────────────────────────────────────────────────────
@@ -735,6 +914,14 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let display_tz = env::var("DISPLAY_TZ")
+        .ok()
+        .and_then(|s| s.parse::<Tz>().ok())
+        .unwrap_or_else(|| {
+            tracing::warn!("DISPLAY_TZ not set or invalid; defaulting to UTC");
+            chrono_tz::UTC
+        });
+
     let config = Config {
         calendar_id: env::var("GOOGLE_CALENDAR_ID").unwrap_or_else(|_| "primary".into()),
         google_api_key: env::var("GOOGLE_API_KEY").ok(),
@@ -751,6 +938,9 @@ async fn main() -> Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(2.3522),
         trmnl_api_key: env::var("TRMNL_API_KEY").ok(),
+        display_tz,
+        base_url: env::var("BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:4567".into()),
     };
 
     let (font_regular, font_bold) = load_fonts();
@@ -777,6 +967,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config),
         oauth,
         cache: Arc::new(RwLock::new(DisplayCache::default())),
+        devices: Arc::new(RwLock::new(Vec::new())),
         font_regular: Arc::new(font_regular),
         font_bold: Arc::new(font_bold),
     };
@@ -795,15 +986,22 @@ async fn main() -> Result<()> {
     }
 
     let app = Router::new()
-        .route("/display", get(handle_display))
-        .route("/preview", get(handle_preview))
-        .route("/health", get(handle_health))
+        // ── BYOS firmware endpoints ─────────────────────────────────────────
+        .route("/api/setup",          get(handle_setup))
+        .route("/api/display",        get(handle_api_display))
+        .route("/api/log",            post(handle_log))
+        .route("/api/image/{filename}", get(handle_image))
+        // ── Browser / debug ─────────────────────────────────────────────────
+        .route("/preview",            get(handle_preview))
+        .route("/health",             get(handle_health))
         .with_state(state);
 
     let bind = env::var("BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
     info!("Listening on http://{bind}");
-    info!("  BMP  → http://{bind}/display   (TRMNL firmware)");
-    info!("  PNG  → http://{bind}/preview   (browser preview)");
+    info!("  BYOS setup   → GET  http://{bind}/api/setup");
+    info!("  BYOS display → GET  http://{bind}/api/display");
+    info!("  BYOS log     → POST http://{bind}/api/log");
+    info!("  Browser PNG  → GET  http://{bind}/preview");
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;

@@ -15,7 +15,7 @@
             },
             "command": "~/.cargo/bin/cargo", // note: full path to the cargo
             "args": [
-                "run","--bin", "trmnl-display"
+                "run","--bin", "trmnl-rs"
             ],
             "group": {
                 "kind": "build",
