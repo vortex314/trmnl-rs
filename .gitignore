@@ -2,4 +2,5 @@
 client_secret.json
 .env
 Cargo.lock
+trmnl-image.tar
 

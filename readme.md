@@ -236,8 +236,14 @@ docker build -t trmnl .
 docker save trmnl > trmnl-image.tar
 ```
 
-Deploy via portainer 
+# Deploy via portainer 
+- goto 'Images' and 'import image' and 'select file' and 'upload'
 - upload image via 'import file'
-- create container based on image 
+- create container based on image : 'trmnl-service'
 - set network : host
-- restart policy : always
+- check logs for polling by device
+
+# TEST
+```http
+http://pcthink.local:4567/preview
+```
